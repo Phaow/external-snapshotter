@@ -17,6 +17,7 @@ limitations under the License.
 package common_controller
 
 import (
+	"fmt"
 	"testing"
 
 	crdv1beta2 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumegroupsnapshot/v1beta2"
@@ -375,6 +376,114 @@ func TestCreateGroupSnapshotSync(t *testing.T) {
 			test:           testSyncGroupSnapshot,
 			expectSuccess:  false,
 		},
+		{
+			name: "1-12 - successful create group snapshot with stale cache (race condition fix test)",
+			initialGroupSnapshots: newGroupSnapshotArray(
+				"group-snap-1-12", "group-snapuid1-12", map[string]string{
+					"app.kubernetes.io/name": "postgresql",
+				},
+				"", classGold, "", nil, nil, nil, true, false, nil,
+			),
+			expectedGroupSnapshots: newGroupSnapshotArray(
+				"group-snap-1-12", "group-snapuid1-12", map[string]string{
+					"app.kubernetes.io/name": "postgresql",
+				},
+				"", classGold, "groupsnapcontent-group-snapuid1-12", &False, nil, nil, false, false, nil,
+			),
+			// Initial content in cache has incomplete status (simulating stale cache)
+			initialGroupContents: withIncompleteVolumeSnapshotInfoList(
+				newGroupSnapshotContentWithFullStatus(
+					"groupsnapcontent-group-snapuid1-12", "group-snapuid1-12", "group-snap-1-12",
+					"group-snapshot-handle", classGold, []string{"1-pv-handle6-12", "2-pv-handle6-12"},
+					"", deletionPolicy, nil, false,
+				),
+			),
+			// Expected content should have full status (from API refetch)
+			expectedGroupContents: newGroupSnapshotContentWithFullStatus(
+				"groupsnapcontent-group-snapuid1-12", "group-snapuid1-12", "group-snap-1-12",
+				"group-snapshot-handle", classGold, []string{"1-pv-handle6-12", "2-pv-handle6-12"},
+				"", deletionPolicy, nil, false,
+			),
+			initialClaims: withClaimLabels(
+				newClaimCoupleArray("claim1-12", "pvc-uid6-12", "1Gi", "volume6-12", v1.ClaimBound, &classGold),
+				map[string]string{
+					"app.kubernetes.io/name": "postgresql",
+				}),
+			initialVolumes: newVolumeCoupleArray("volume6-12", "pv-uid6-12", "pv-handle6-12", "1Gi", "pvc-uid6-12", "claim1-12", v1.VolumeBound, v1.PersistentVolumeReclaimDelete, classGold),
+			errors:         noerrors,
+			test:           testSyncGroupSnapshot,
+			expectSuccess:  true,
+		},
 	}
 	runSyncTests(t, tests, nil, groupSnapshotClasses)
+}
+
+// withIncompleteVolumeSnapshotInfoList simulates a stale cache where the
+// VolumeSnapshotInfoList has empty VolumeHandle/SnapshotHandle fields.
+// This reproduces the race condition where the sidecar controller fails to
+// update status due to conflicts.
+func withIncompleteVolumeSnapshotInfoList(contents []*crdv1beta2.VolumeGroupSnapshotContent) []*crdv1beta2.VolumeGroupSnapshotContent {
+	for i := range contents {
+		if contents[i].Status != nil && len(contents[i].Status.VolumeSnapshotInfoList) > 0 {
+			// Set handles to empty to simulate incomplete status
+			for j := range contents[i].Status.VolumeSnapshotInfoList {
+				contents[i].Status.VolumeSnapshotInfoList[j].VolumeHandle = ""
+				contents[i].Status.VolumeSnapshotInfoList[j].SnapshotHandle = ""
+			}
+		}
+	}
+	return contents
+}
+
+// newGroupSnapshotContentWithFullStatus creates a VolumeGroupSnapshotContent
+// with fully populated VolumeSnapshotInfoList in the status.
+func newGroupSnapshotContentWithFullStatus(
+	groupSnapshotContentName, boundToGroupSnapshotUID, boundToGroupSnapshotName,
+	groupSnapshotHandle, groupSnapshotClassName string,
+	volumeHandles []string, targetVolumeGroupSnapshotHandle string,
+	deletionPolicy crdv1.DeletionPolicy, creationTime *metav1.Time,
+	withFinalizer bool,
+) []*crdv1beta2.VolumeGroupSnapshotContent {
+	content := newGroupSnapshotContent(
+		groupSnapshotContentName, boundToGroupSnapshotUID, boundToGroupSnapshotName,
+		groupSnapshotHandle, groupSnapshotClassName, volumeHandles,
+		targetVolumeGroupSnapshotHandle, deletionPolicy, creationTime,
+		withFinalizer, true, // withStatus = true
+	)
+
+	// Add fully populated VolumeSnapshotInfoList to status
+	if content.Status == nil {
+		ready := true
+		content.Status = &crdv1beta2.VolumeGroupSnapshotContentStatus{
+			CreationTime:                creationTime,
+			ReadyToUse:                  &ready,
+			VolumeGroupSnapshotHandle:   &groupSnapshotHandle,
+			VolumeSnapshotInfoList:      []crdv1beta2.VolumeSnapshotInfo{},
+		}
+	}
+
+	// Create VolumeSnapshotInfo entries for each volume
+	for idx, volumeHandle := range volumeHandles {
+		snapshotHandle := fmt.Sprintf("snapshot-handle-%d", idx)
+		size := int64(1 * 1024 * 1024 * 1024) // 1Gi
+		ready := true
+
+		info := crdv1beta2.VolumeSnapshotInfo{
+			VolumeHandle:   volumeHandle,
+			SnapshotHandle: snapshotHandle,
+			RestoreSize:    &size,
+			ReadyToUse:     &ready,
+		}
+		if creationTime != nil {
+			timestamp := creationTime.Time.Unix()
+			info.CreationTime = &timestamp
+		}
+
+		content.Status.VolumeSnapshotInfoList = append(
+			content.Status.VolumeSnapshotInfoList,
+			info,
+		)
+	}
+
+	return []*crdv1beta2.VolumeGroupSnapshotContent{content}
 }
